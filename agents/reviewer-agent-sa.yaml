@@ -1,0 +1,12 @@
+# Shared ServiceAccount for the reviewer agent (both the cooperative and transparent deployment versions use
+# it). This is the workload's SPIFFE identity:
+#   spiffe://cluster.local/ns/reviewer-agent/sa/reviewer-agent
+# It is what the GitHub MCP identity-routed HTTPRoute matches (github-mcp-route.yaml) to send the
+# reviewer to its own backend (github-mcp-reviewer -> the approve+merge credential), and what the
+# gateway's frontend edge gate admits. This DIFFERENT identity from the writer is the whole point:
+# only the reviewer's identity is authorized for the merge-PR path.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reviewer-agent
+  namespace: reviewer-agent

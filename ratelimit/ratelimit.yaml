@@ -1,0 +1,77 @@
+# The rate limit service — Envoy's reference implementation of the Rate Limit gRPC protocol.
+#
+# The gateway calls this service over gRPC (:8081) for each governed request; the service looks up
+# the matching descriptor in its config (ratelimit-config.yaml, mounted read-only below),
+# increments the counter in Redis (REDIS_URL), and returns OK or OVER_LIMIT. The gateway's
+# AgentgatewayPolicy references this Service at ratelimit.ratelimit.svc:8081.
+#
+# Runtime env:
+#   REDIS_SOCKET_TYPE / REDIS_URL   how to reach Redis (redis.yaml Service, tcp redis:6379)
+#   RUNTIME_ROOT / RUNTIME_SUBDIRECTORY  where the service reads its config tree; combined with the
+#                                        volumeMounts they resolve to /data/ratelimit/config/*.yaml
+#                                        (one file per domain: config.yaml + token-budgets.yaml)
+#   RUNTIME_WATCH_ROOT=false         load config once at start (no symlink-swap watching)
+#   USE_STATSD=false                 don't emit statsd metrics in this walkthrough
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratelimit
+  namespace: ratelimit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ratelimit
+  template:
+    metadata:
+      labels:
+        app: ratelimit
+    spec:
+      containers:
+        - name: ratelimit
+          image: envoyproxy/ratelimit:master
+          command: ["/bin/ratelimit"]
+          env:
+            - name: REDIS_SOCKET_TYPE
+              value: tcp
+            - name: REDIS_URL
+              value: redis:6379
+            - name: RUNTIME_ROOT
+              value: /data
+            - name: RUNTIME_SUBDIRECTORY
+              value: ratelimit
+            - name: RUNTIME_WATCH_ROOT
+              value: "false"
+            - name: USE_STATSD
+              value: "false"
+          ports:
+            - containerPort: 8081
+              name: grpc
+          volumeMounts:
+            # One subPath mount per domain file, both landing in the runtime config dir. subPath
+            # (vs. mounting the whole ConfigMap dir) avoids the ..data/..timestamp dotfiles that the
+            # runtime loader would otherwise try to parse.
+            - name: config
+              mountPath: /data/ratelimit/config/config.yaml
+              subPath: config.yaml
+            - name: config
+              mountPath: /data/ratelimit/config/token-budgets.yaml
+              subPath: token-budgets.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: ratelimit-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratelimit
+  namespace: ratelimit
+spec:
+  selector:
+    app: ratelimit
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: 8081

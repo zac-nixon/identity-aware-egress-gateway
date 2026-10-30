@@ -1,0 +1,20 @@
+# AgentgatewayParameters — infrastructure configuration referenced by the Gateway's
+# infrastructure.parametersRef. Must be applied before (or with) the Gateway.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: egress
+  namespace: agentgateway-system
+spec:
+  deployment:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: agentgateway-egress
+            istio.io/dataplane-mode: none
+            networking.istio.io/tunnel: http
+  istio: {}
+  service:
+    spec:
+      type: ClusterIP

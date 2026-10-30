@@ -1,0 +1,53 @@
+# COOPERATIVE route: OpenAI-format inference on the gateway Service -> per-agent Bedrock backend.
+#
+# The agent POSTs to the gateway's own Service (http://egress.agentgateway-system.svc.cluster.local
+# /v1/chat/completions, OpenAI shape, no creds). ztunnel HBONEs it to the gateway with the agent's
+# identity; this route forwards to the agent's OWN cooperative backend, which steers the model and vends
+# that agent's credential.
+#
+# IDENTITY ROUTING (per-agent credentials): each rule ANDs the OpenAI path with one agent's stamped
+# SPIFFE identity (x-agentgateway-spiffe, written by identity-header.yaml) and points at that agent's
+# backend — so the writer and reviewer get DIFFERENT Bedrock credentials (same model as the GitHub
+# MCP route). An identity matching no rule gets a 404 (no backend, no credential), even after the
+# coarse frontend gate. PREREQUISITE: identity-header.yaml must be applied, or the header never matches.
+#
+# MODEL / PROVIDER STEERING: because the agent targets the gateway (not a provider host), the gateway
+# decides model/provider per backend. To steer further, add more backends + rules (path- or
+# model-based) — the agent's endpoint never changes.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: bedrock-cooperative
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+    - name: egress
+      namespace: agentgateway-system
+      sectionName: http
+  rules:
+    # Writer identity + the OpenAI path -> writer's cooperative backend (writer credential).
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+          headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/writer-agent/sa/writer-agent
+      backendRefs:
+        - name: bedrock-cooperative-writer
+          group: agentgateway.dev
+          kind: AgentgatewayBackend
+    # Reviewer identity + the OpenAI path -> reviewer's cooperative backend (reviewer credential).
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+          headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/reviewer-agent/sa/reviewer-agent
+      backendRefs:
+        - name: bedrock-cooperative-reviewer
+          group: agentgateway.dev
+          kind: AgentgatewayBackend

@@ -1,0 +1,10 @@
+# Shared ServiceAccount for the writer agent (both the cooperative and transparent deployment versions use
+# it). This is the workload's SPIFFE identity:
+#   spiffe://cluster.local/ns/writer-agent/sa/writer-agent
+# It is what the GitHub MCP identity-routed HTTPRoute matches, and what the gateway's frontend edge
+# gate admits. Both agent versions share it so their egress is governed identically.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: writer-agent
+  namespace: writer-agent

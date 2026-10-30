@@ -1,0 +1,37 @@
+# Gateway-wide SPIFFE identity stamp — SHARED by every identity-matched route (GitHub MCP + Bedrock).
+#
+# PreRouting policies can only target a Gateway (not a listener/route), so this one policy runs for
+# ALL of the gateway's listeners before route selection. It writes the caller's VERIFIED SPIFFE
+# identity into the x-agentgateway-spiffe header, which the HTTPRoutes then match on to (a) route
+# each agent to its own credential (github-mcp-route.yaml) and (b) authenticate LLM egress so only
+# known agent identities reach Bedrock (bedrock-cooperative-route.yaml / bedrock-transparent-route.yaml).
+#
+# This lives in its OWN manifest (not inside any one route file) so it is applied exactly once and
+# covers every route — a route that matches on x-agentgateway-spiffe is only safe if this stamp is
+# present, so apply this BEFORE any route. `set` (not `add`) overwrites any client-supplied value,
+# so the header cannot be spoofed; and the frontend gate (frontend-authz.yaml, also Gateway-wide)
+# already rejects any caller with no verified HBONE identity, so source.identity is always present
+# here.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: spiffe-identity-header
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: egress
+  traffic:
+    phase: PreRouting          # run before route selection so the header is available to matches
+    transformation:
+      request:
+        set:                   # SET overwrites any client-supplied value (anti-spoofing)
+          - name: x-agentgateway-spiffe
+            value: >
+              "spiffe://" +
+              source.identity.trustDomain +
+              "/ns/" +
+              source.identity.namespace +
+              "/sa/" +
+              source.identity.serviceAccount

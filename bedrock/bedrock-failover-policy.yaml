@@ -1,0 +1,77 @@
+# Model-failover policies for the COOPERATIVE path — the second half of failover.
+#
+# Priority groups (bedrock-cooperative-backend.yaml) define the failover ORDER, but on their own they
+# never fail over: a provider is only skipped once it is EVICTED, and eviction requires a health
+# policy. This file supplies both documented pieces:
+#   1. a HEALTH policy that classifies bad responses and evicts the failing provider, and
+#   2. a RETRY policy so the client never sees the error that triggered failover.
+#
+# Both use the OSS agentgateway.dev `AgentgatewayPolicy` kind — NO enterprise CRDs. `spec.backend.health`
+# (eviction) and `spec.traffic.retry` are open-source fields; Solo's guide just renders them on the
+# Enterprise* kinds. This OSS walkthrough shows the same AgentgatewayBackend groups + AgentgatewayPolicy
+# health pattern end to end: https://www.cloudnativedeepdive.com/multi-model-failover-in-your-ai-gateway/
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# HEALTH POLICY — targets the two per-agent cooperative backends. When a provider's response matches
+# unhealthyCondition, it counts toward eviction; once evicted, its priority group is (being
+# single-provider) empty, so requests fail over to the next group.
+#
+#   unhealthyCondition: evict on server errors (5xx) AND provider throttling (429). Including 429 is
+#     what makes the gateway fail over to the fallback model when the PRIMARY provider rate-limits
+#     you. (A 429 with a Retry-After header uses that duration as the eviction time.)
+#   eviction.consecutiveFailures: 1 — evict on the FIRST 429/5xx so a rate-limited primary fails over
+#     to the next model immediately. Raise it (e.g. 3) if you'd rather tolerate transient blips and
+#     avoid flapping, at the cost of a slower fail-over.
+#   eviction.duration: 30s — base eviction window; grows with multiplicative backoff on repeated
+#     evictions, so a persistently-broken model costs ~one failed attempt per (widening) window.
+#
+# INDEPENDENCE FROM THE TOKEN BUDGET: this evicts on 429s RETURNED BY THE PROVIDER. The gateway's own
+# LLM token-budget 429 (ratelimit/llm-token-limit.yaml) is a local decision, not a backend response,
+# so it does NOT evict a model or trigger fallback — an exhausted quota correctly returns 429 to the
+# client instead of silently burning the fallback model.
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: bedrock-cooperative-failover-health
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: bedrock-cooperative-writer
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: bedrock-cooperative-reviewer
+  backend:
+    health:
+      unhealthyCondition: "response.code >= 500 || response.code == 429"
+      eviction:
+        duration: 30s
+        consecutiveFailures: 1
+---
+# RETRY POLICY — targets the cooperative HTTPRoute. Eviction alone still returns the first error to the
+# client (the response comes back before the eviction takes effect). A retry re-attempts the request
+# inside the SAME client call; because the failing provider is now evicted, the retry lands on the
+# fallback group. Health + retry together = transparent failover. A retry WITHOUT a health policy
+# would just hit the same primary again, so both are required.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: bedrock-cooperative-failover-retry
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: bedrock-cooperative
+  traffic:
+    retry:
+      attempts: 2
+      backoff: 1s
+      codes:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504

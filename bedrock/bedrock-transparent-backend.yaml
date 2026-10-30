@@ -1,0 +1,115 @@
+# TRANSPARENT backends — native Bedrock Converse, LLM-AWARE via Detect, NO STORED CREDENTIALS.
+#
+# ONE BACKEND PER AGENT, each reaching Bedrock as a DIFFERENT AWS IDENTITY:
+#   bedrock-transparent-writer    -> assumes arn:...:role/agentgateway-bedrock-writer
+#   bedrock-transparent-reviewer  -> assumes arn:...:role/agentgateway-bedrock-reviewer
+#
+# The agent speaks Bedrock-native Converse to the real host (POST /model/<model-id>/converse) with
+# NO credential; the catch-all ServiceEntry (gateway/service-entry.yaml) captures it and this backend's route (bedrock-transparent-route.yaml)
+# selects the agent's backend by identity. The gateway signs the call as that agent's IAM role and
+# extracts the model + token usage for rate limiting.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# CREDENTIALS: EKS POD IDENTITY + PER-AGENT assumeRole
+#
+# Same mechanism as the cooperative backends — see bedrock-cooperative-backend.yaml for the full rationale.
+# In short: the gateway pod's ServiceAccount is mapped by EKS Pod Identity to the
+# `agentgateway-egress` role (which holds NO Bedrock permissions, only sts:AssumeRole +
+# sts:TagSession); this policy assumes the per-agent role and signs with SigV4. The same two agent
+# roles serve both the cooperative and transparent paths, so an agent has ONE AWS identity regardless of which
+# egress style it uses — which is what makes CloudTrail and cost attribution coherent.
+#
+# region / serviceName are omitted deliberately: the typed `bedrock` provider supplies both. Set them
+# explicitly under `aws:` only if you hit a signature mismatch or a "no region" error.
+#
+# ORDERING CAVEAT: SigV4 signing runs LAST, after every request-mutating policy. The identity stamp
+# (gateway/identity-header.yaml) is PreRouting so it is safely ordered before signing. Do not attach
+# a request transformation to these backends.
+#
+# SETUP: run bedrock/setup-pod-identity.sh once, then replace <ACCOUNT_ID> below.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# WHY `ai.provider.bedrock` + `Detect` INSTEAD OF A STATIC PASSTHROUGH:
+# A `static` backend is opaque — the gateway can't see model or token usage, so token-based rate
+# limiting doesn't work on it. The `Detect` route type forwards the request UNCHANGED (the agent
+# still speaks native Converse — no agent change) but makes the gateway LLM-aware enough to:
+#   * extract the model from the URL path (/model/<model-id>/converse), and
+#   * extract token usage (inputTokens/outputTokens/totalTokens) from the Converse response,
+# so identity- AND model-scoped token rate limiting + telemetry apply. Guardrails / request-shaping
+# do NOT apply under Detect (that needs the Completions route type, which would reshape the request).
+# Verified in OSS agentgateway source (crates/llm: RouteType::Detect, extract_model_from_path covers
+# /converse|/converse-stream|/invoke, types/bedrock.rs TokenUsage).
+#
+# NOTE: model FAILOVER still does not apply here — Detect forwards to whatever model the agent named
+# in the URL; there are no priority groups to fall back through. That is inherent to the agent owning
+# the model choice (see bedrock-cooperative-backend.yaml for the gateway-steered failover path).
+#
+# IAM CONSEQUENCE OF THE AGENT OWNING MODEL CHOICE: because the agent puts the model in the URL, the
+# per-agent role's model-ARN list is now the ONLY thing stopping an agent from invoking a model it was
+# not granted. On the cooperative path the gateway also constrains the model; here IAM is the sole control.
+# That is a genuine security improvement over a shared bearer key.
+#
+# No BackendTLSPolicy: the bedrock provider manages the Bedrock endpoint + TLS from the region (same
+# as the cooperative backends), so no static-host TLS-origination policy is needed.
+#
+# The provider model is intentionally omitted — with Detect the model comes from the request URL. If
+# your agentgateway build requires a default model on the provider, add one (it won't override the
+# per-request URL model under Detect).
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-transparent-writer
+  namespace: agentgateway-system
+spec:
+  ai:
+    provider:
+      bedrock:
+        region: "us-east-1"
+  policies:
+    auth:
+      aws:
+        assumeRole:
+          # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+          # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+          # placeholder is REJECTED by the API server — never apply this file directly.
+          roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-writer
+          sessionName: writer-agent
+          tags:
+            - key: agent
+              value: writer
+    ai:
+      routes:
+        "/converse": Detect                  # native Converse: forward as-is, extract model + tokens
+        "/converse-stream": Detect
+        "/invoke": Detect
+        "/invoke-with-response-stream": Detect
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-transparent-reviewer
+  namespace: agentgateway-system
+spec:
+  ai:
+    provider:
+      bedrock:
+        region: "us-east-1"
+  policies:
+    auth:
+      aws:
+        assumeRole:
+          # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+          # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+          # placeholder is REJECTED by the API server — never apply this file directly.
+          roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-reviewer
+          sessionName: reviewer-agent
+          tags:
+            - key: agent
+              value: reviewer
+    ai:
+      routes:
+        "/converse": Detect
+        "/converse-stream": Detect
+        "/invoke": Detect
+        "/invoke-with-response-stream": Detect

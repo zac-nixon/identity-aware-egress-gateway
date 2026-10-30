@@ -1,0 +1,38 @@
+# Agent Gateway egress Gateway with two listeners:
+#   - http  (:80)    — routes attach here; the tunneled inner request dispatches to it
+#   - hbone (:15008)  — HBONE mTLS transport that carries the caller's SPIFFE identity
+#
+# infrastructure.parametersRef points at the AgentgatewayParameters (name: egress), which
+# must exist first (see agentgateway-parameters.yaml). Nothing of ours is named `agentgateway`
+# (that name belongs to the Helm control-plane release) to avoid resource-name collisions.
+#
+# NOTE: the Gateway name must NOT be `agentgateway`. The Agent Gateway controller derives the
+# data-plane proxy Deployment name from the Gateway name, and the Helm control-plane release is
+# named `agentgateway` (it already owns a Deployment/agentgateway). Reusing that name makes the
+# controller try to overwrite the Helm Deployment; the immutable spec.selector then rejects the
+# apply ("field is immutable") and the proxy never provisions. `egress` avoids the collision.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: egress
+  namespace: agentgateway-system
+spec:
+  gatewayClassName: agentgateway
+  infrastructure:
+    parametersRef:
+      group: agentgateway.dev
+      kind: AgentgatewayParameters
+      name: egress
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: hbone
+      port: 15008
+      protocol: HBONE
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -1,0 +1,77 @@
+# Per-agent egress backends for GitHub's MCP host — ONE PER AGENT — with TLS origination.
+#
+# Each backend is a plain static HTTP backend pointing at GitHub's real host on :443. The gateway
+# receives the agent's request as plaintext HTTP (delivered over HBONE by ztunnel), injects that
+# agent's credential, and ORIGINATES TLS to api.githubcopilot.com:443 (BackendTLSPolicy below). The
+# agent never handles TLS or the token.
+#   github-mcp-writer    -> github-mcp-writer-credential    (writer PAT: open PRs / comment)
+#   github-mcp-reviewer  -> github-mcp-reviewer-credential  (reviewer PAT: approve + merge)
+#
+# WHICH agent reaches WHICH backend is decided by identity-based routing (github-mcp-route.yaml):
+# the PreRouting policy stamps the verified SPIFFE identity into a header, and the HTTPRoute routes
+# on it. All agents address the same real host (http://api.githubcopilot.com/mcp/) — no per-agent
+# client config.
+#
+# Apply order: gateway/ (service-entry.yaml, frontend-authz.yaml, identity-header.yaml) ->
+# github-mcp-secret.yaml -> github-mcp-backend.yaml -> github-mcp-route.yaml.
+#
+# NOTE: these are `static` HTTP backends (the transparent-egress + TLS-origination pattern). If you
+# later want MCP-aware tool-level governance, switch the backend to `spec.mcp` (MCP proxy); the
+# BackendTLSPolicy and credential injection carry over. Confirm `policies.auth.secretRef` injection
+# on a static backend against your agentgateway version.
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: github-mcp-writer
+  namespace: agentgateway-system
+spec:
+  static:
+    host: api.githubcopilot.com
+    port: 443
+  policies:
+    auth:
+      secretRef:
+        name: github-mcp-writer-credential   # writer's token, injected as Authorization
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: github-mcp-writer
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: github-mcp-writer
+  validation:
+    hostname: api.githubcopilot.com          # SNI + cert verification
+    wellKnownCACertificates: System          # trust the system CA store
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: github-mcp-reviewer
+  namespace: agentgateway-system
+spec:
+  static:
+    host: api.githubcopilot.com
+    port: 443
+  policies:
+    auth:
+      secretRef:
+        name: github-mcp-reviewer-credential   # reviewer's token, injected as Authorization
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: github-mcp-reviewer
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: github-mcp-reviewer
+  validation:
+    hostname: api.githubcopilot.com
+    wellKnownCACertificates: System

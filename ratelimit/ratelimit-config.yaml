@@ -1,0 +1,101 @@
+# Rate limit rules — the actual limits enforced by the rate limit service.
+#
+# This ConfigMap holds TWO independent runtime configs, one per Envoy rate-limit DOMAIN. The
+# ratelimit Deployment mounts each as its own file under /data/ratelimit/config/ (see
+# ratelimit.yaml), and the service keys everything by domain:
+#
+#   config.yaml          domain: agentgateway  — request-count limit (1 cost per request), keyed on
+#                                                 the verified SPIFFE identity. Consumed by the
+#                                                 request-rate-limit AgentgatewayPolicy
+#                                                 (ratelimit/request-rate-limit.yaml) on the GitHub
+#                                                 MCP route.
+#   token-budgets.yaml   domain: llm-tokens     — per-AGENT daily LLM TOKEN budget. Consumed by the
+#                                                 llm-token-limit-* AgentgatewayPolicies
+#                                                 (ratelimit/llm-token-limit.yaml), whose descriptor is
+#                                                 marked `unit: Tokens` so Agent Gateway reports the
+#                                                 request's total LLM token count as the descriptor
+#                                                 cost (evaluated AFTER completion) instead of
+#                                                 1-per-request. Keyed on the verified SPIFFE identity.
+#
+# A descriptor's `key`/`value` here must MATCH the descriptor `entries[].name` (and any value) sent
+# by the AgentgatewayPolicy for that domain. Case-sensitive.
+#
+# Field reference:
+#   domain            Groups rules; must MATCH the domain in the AgentgatewayPolicy.
+#   descriptors       Array of rules; each matches against the entries the gateway sends.
+#   key               Descriptor name (matches the policy entry `name`).
+#   value             Optional; fine-grained match on a specific entry value.
+#   rate_limit.unit   Time window: second, minute, hour, or day.
+#   requests_per_unit Budget per window. For a `unit: Tokens` descriptor this is a TOKEN-cost budget,
+#                     NOT an HTTP request count, despite the field name.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ratelimit-config
+  namespace: ratelimit
+data:
+  # Domain: agentgateway — request-count limit per verified caller identity.
+  config.yaml: |
+    domain: agentgateway
+    descriptors:
+      # Rate limit per verified caller identity: 60 requests per minute per SPIFFE identity.
+      # Keyed on the x-agentgateway-spiffe header stamped by gateway/identity-header.yaml.
+      - key: x-agentgateway-spiffe
+        rate_limit:
+          unit: minute
+          requests_per_unit: 60
+
+  # Domain: llm-tokens — per-AGENT daily LLM TOKEN budget (shared across gateway replicas via Redis).
+  # requests_per_unit is a token-cost budget because the llm-token-limit-* policies mark it unit: Tokens.
+  # Keyed on the verified SPIFFE identity; each agent's `value` gets its own counter and limit.
+  # Adjust the numbers per workload; an unlisted identity is not limited (add a bare `key: identity`
+  # with no `value` as a catch-all default if you want one).
+  #
+  # TRANSPARENT-PATH MATCHING — why every identity carries a bare `key: model` default:
+  # the transparent policy sends the PAIR (identity, model), and the rate limit service only applies a
+  # limit if that full pair matches a leaf. It does NOT fall back to the identity-level limit above.
+  # So a model with no entry here would be UNLIMITED. The explicit Sonnet entry sets the budget for
+  # the model the transparent Deployments actually use (BEDROCK_MODEL=global.anthropic.claude-sonnet-4-6;
+  # no colon, so boto3's percent-encoding does not change it). The bare `key: model` catches every
+  # other model — including amazon.nova-micro-v1:0, which boto3 sends as amazon.nova-micro-v1%3A0 —
+  # with its own per-model counter, so no transparent-path model is ever unbudgeted.
+  token-budgets.yaml: |
+    domain: llm-tokens
+    descriptors:
+      # Writer agent.
+      - key: identity
+        value: spiffe://cluster.local/ns/writer-agent/sa/writer-agent
+        # COOPERATIVE path (identity leaf, no model): per-agent total budget — 1,000,000 tokens/day.
+        rate_limit:
+          unit: day
+          requests_per_unit: 1000000
+        # TRANSPARENT path (identity + model): per-agent, per-model budget.
+        descriptors:
+          - key: model
+            value: global.anthropic.claude-sonnet-4-6
+            rate_limit:
+              unit: day
+              requests_per_unit: 1000000
+          - key: model                    # any other model: 200,000 tokens/day per model
+            rate_limit:
+              unit: day
+              requests_per_unit: 200000
+      # Reviewer agent.
+      - key: identity
+        value: spiffe://cluster.local/ns/reviewer-agent/sa/reviewer-agent
+        # COOPERATIVE path (identity leaf, no model): per-agent total budget — 500,000 tokens/day.
+        rate_limit:
+          unit: day
+          requests_per_unit: 500000
+        # TRANSPARENT path (identity + model): per-agent, per-model budget.
+        descriptors:
+          - key: model
+            value: global.anthropic.claude-sonnet-4-6
+            rate_limit:
+              unit: day
+              requests_per_unit: 500000
+          - key: model                    # any other model: 200,000 tokens/day per model
+            rate_limit:
+              unit: day
+              requests_per_unit: 200000

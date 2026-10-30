@@ -1,0 +1,135 @@
+# Agent egress lockdown — the fail-closed backstop of "everything must go through the gateway".
+#
+# This is the AWS VPC CNI ApplicationNetworkPolicy CRD (networking.k8s.aws/v1alpha1) — the
+# application-centric, node-enforced (eBPF) egress control on EKS. One policy per agent namespace
+# (it is namespaced and cannot span namespaces); each selects every pod in that namespace and
+# DENIES all egress except the two flows an agent legitimately needs.
+#
+# WHY IT ALLOWS THE GATEWAY HOP, NOT THE HOST/VIP (the key insight — EGRESS_LEARNINGS #15):
+# When the agent connects to api.githubcopilot.com / the Bedrock host (or the gateway Service), Istio
+# ambient's in-pod REDIRECT is a *local* DNAT to ztunnel inside the pod netns; ztunnel then
+# originates an HBONE mTLS tunnel from the pod's identity to the Agent Gateway proxy pods on :15008.
+# So what the node's eBPF policy actually sees leaving the pod's veth is that HBONE hop — NOT the
+# external host, NOT the ServiceEntry address. Allowing a domainName/VIP here would permit a
+# destination that never egresses while the real HBONE hop stays denied. So: allow the gateway pods
+# on :15008 (+ DNS); everything else is dropped.
+#
+# WHY NO `domainNames` PASSTHROUGH RULE: the ApplicationNetworkPolicy also supports `domainNames`
+# (FQDN) and `ipBlock` peers — you would use a `domainNames` rule to allow a host the agent reaches
+# DIRECTLY (bypassing the gateway, e.g. a SigV4 endpoint). This example deliberately routes ALL
+# egress (GitHub + Bedrock) THROUGH the gateway, so there is no direct host to allow — every governed
+# destination is covered by the single :15008 HBONE rule. Add hosts at the gateway, never here.
+#
+# The unlisted-host case is also closed, two ways. gateway/service-entry.yaml captures ALL :80 traffic
+# (0.0.0.0/0), so a plaintext request to any host — listed or not — goes over HBONE to the gateway,
+# where a host with no route gets a 404. Traffic on any other port (e.g. TLS on :443) is not
+# captured, so ztunnel sends it DIRECT to the real IP — which matches no allow rule here and is
+# dropped at the node.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# DNS: MUST BE AN ipBlock ON THIS CLUSTER — DO NOT "FIX" IT TO A podSelector.
+#
+# On EKS Auto Mode, CoreDNS is a MANAGED component. Its pods are not selectable by the customer, so a
+# peer like `namespaceSelector: kube-system + podSelector: k8s-app=kube-dns` matches ZERO pods, which
+# under a default-deny egress policy means every DNS packet is dropped. The label-selector form looks
+# more portable and is the usual advice for stock NetworkPolicy, but it silently breaks Auto Mode.
+# Allowing the kube-dns SERVICE ClusterIP by CIDR is the only form that works here.
+#
+# If DNS is blocked, the symptom in the agent logs is:
+#   ConnectError('[Errno -3] Temporary failure in name resolution')   <- DNS packets dropped
+#   ConnectTimeout('')                                               <- cached name, connection dropped
+#
+# <CLUSTER_DNS_IP> is rendered by install.sh, because pinning the wrong address blocks all DNS: EKS
+# uses the 10.100.0.0/16 service CIDR by default (resolver at 10.100.0.10) and 172.20.0.0/16 when the
+# VPC CIDR would overlap (172.20.0.10). install.sh takes the kube-dns ClusterIP, or on Auto Mode
+# (no kube-dns Service) the `kubernetes` Service IP with the last octet set to .10. Override with
+# CLUSTER_DNS_IP=<ip>.
+#
+# Watch for a DUPLICATE `egress:` key when editing these policies. YAML parsers disagree (last-wins
+# vs. error) and kubectl REJECTS duplicate mapping keys outright, so the whole file fails to apply.
+#
+# First diagnostic when an agent cannot resolve anything: delete this policy and retest.
+#   kubectl -n writer-agent delete applicationnetworkpolicy agent-egress-lockdown
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#
+# REQUIRES EKS Auto Mode / the VPC CNI Network Policy controller enabled; otherwise the object is
+# admitted but NOT enforced (fail-open) — verify enforcement before relying on it.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# VALIDATED AND ALWAYS APPLIED. install.sh applies this as part of AGENT_MANIFESTS.
+#
+# The key question is which destination the node's eBPF policy actually observes for
+# mesh-captured traffic. Confirmed on-cluster: it sees the POST-redirect hop — ztunnel's HBONE
+# connection to the gateway pods on :15008 — which is exactly what rule 2 allows. Requests flow and
+# the gateway logs them.
+#
+# The corollary matters for anyone extending this file: allowing the external host or the ServiceEntry
+# VIP here would be useless, because those destinations never appear on the wire. ztunnel's in-pod
+# redirect is a local DNAT inside the pod netns, so the veth only ever carries the HBONE hop. New
+# governed destinations are added AT THE GATEWAY, never here.
+#
+# If agent egress ever goes dark — gateway logs silent, agents reporting ConnectTimeout to everything,
+# and nothing wrong with any route or backend — this policy is the first thing to rule out:
+#   kubectl -n agentgateway-system logs deploy/egress --tail=20
+#   kubectl -n writer-agent   delete applicationnetworkpolicy agent-egress-lockdown
+#   kubectl -n reviewer-agent delete applicationnetworkpolicy agent-egress-lockdown
+#
+# STILL WORTH CONFIRMING PERIODICALLY: that a DIRECT off-gateway connection is genuinely dropped. If
+# the VPC CNI Network Policy controller is not enabled, this object is admitted but NOT enforced
+# (fail-open) — so it can appear to work while providing no protection at all. Enforcement is the
+# thing being relied on here, not the object's existence.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: agent-egress-lockdown
+  namespace: writer-agent
+spec:
+  podSelector: {}            # every pod in the writer-agent namespace
+  policyTypes: [Egress]
+  egress:
+    # 1. DNS to the cluster resolver ONLY — by ClusterIP, because Auto Mode's CoreDNS pods are not
+    #    selectable (see the DNS block in the header; a podSelector here denies all DNS). Resolution
+    #    still works; DNS exfil to arbitrary resolvers is blocked.
+    - to:
+        - ipBlock: { cidr: <CLUSTER_DNS_IP>/32 }    # cluster resolver; rendered by install.sh
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # 2. HBONE mTLS to the Agent Gateway egress proxy pods (the real on-the-wire destination for ALL
+    #    governed egress). ztunnel dials the backing pods on :15008 — select them by label, not the
+    #    VIP or Service ClusterIP.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: agentgateway-system }
+          podSelector:
+            matchLabels: { app: agentgateway-egress }
+      ports:
+        - { protocol: TCP, port: 15008 }
+  # Everything else: default-deny (no egress rule matches => dropped).
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: agent-egress-lockdown
+  namespace: reviewer-agent
+spec:
+  podSelector: {}            # every pod in the reviewer-agent namespace
+  policyTypes: [Egress]
+  egress:
+    # 1. DNS to the cluster resolver ONLY, by ClusterIP — same reasoning as the writer policy above.
+    - to:
+        - ipBlock: { cidr: <CLUSTER_DNS_IP>/32 }    # cluster resolver; rendered by install.sh
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # 2. HBONE mTLS to the Agent Gateway egress proxy pods on :15008.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: agentgateway-system }
+          podSelector:
+            matchLabels: { app: agentgateway-egress }
+      ports:
+        - { protocol: TCP, port: 15008 }
+  # Everything else: default-deny (no egress rule matches => dropped).

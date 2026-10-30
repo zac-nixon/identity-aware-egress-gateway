@@ -1,0 +1,21 @@
+# Two agent namespaces enrolled in the Istio ambient mesh.
+#
+# The istio.io/dataplane-mode: ambient label enrolls each namespace's workloads into ambient L4
+# capture: ztunnel intercepts their egress and originates HBONE mTLS stamped with the caller's
+# SPIFFE identity (spiffe://cluster.local/ns/<namespace>/sa/<serviceAccount>). In the explicit
+# HBONE-endpoint model these namespaces "use" the Agent Gateway by calling its Service directly
+# (there is no per-namespace waypoint binding) — enrollment is what supplies the caller identity
+# on that connection.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: writer-agent
+  labels:
+    istio.io/dataplane-mode: ambient
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reviewer-agent
+  labels:
+    istio.io/dataplane-mode: ambient

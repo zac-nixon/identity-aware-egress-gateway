@@ -1,0 +1,12 @@
+# Namespace for the external rate limit infrastructure.
+#
+# The rate limit service and its Redis backing store live here, separate from the agents and the
+# gateway control plane. The gateway's AgentgatewayPolicy points at the ratelimit Service in this
+# namespace (ratelimit.ratelimit.svc:8081) over the Envoy Rate Limit gRPC protocol.
+#
+# This namespace is intentionally NOT ambient-enrolled: it is gateway-side supporting
+# infrastructure, not an egress-governed agent workload.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ratelimit

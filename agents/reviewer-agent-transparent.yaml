@@ -1,0 +1,92 @@
+# Reviewer agent — TRANSPARENT version: the app speaks to the REAL Bedrock API; the gateway
+# transparently injects the credential.
+#
+# The reviewer reads the writer's open poem PRs, judges each poem with the LLM, then comments and
+# (on approval) MERGES. It makes its Bedrock-native Converse call to the real Bedrock runtime host
+# (BEDROCK_ENDPOINT) with NO credential over plain http://; ztunnel captures the egress and the
+# gateway injects the Bedrock token + originates TLS. The GitHub MCP calls likewise carry no token.
+#
+# Runs as the reviewer ServiceAccount (identity spiffe://.../ns/reviewer-agent/sa/reviewer-agent) —
+# the identity the gateway routes to the approve+merge credential and (forward-looking) authorizes
+# for the merge-PR MCP tool. That authority is what distinguishes it from the writer.
+#   kubectl apply -f reviewer-agent-sa.yaml -f reviewer-agent-transparent.yaml
+#   kubectl -n reviewer-agent logs deploy/reviewer-agent-transparent -f
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reviewer-agent-transparent
+  namespace: reviewer-agent
+  labels:
+    app: reviewer-agent-transparent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reviewer-agent-transparent
+  template:
+    metadata:
+      labels:
+        app: reviewer-agent-transparent
+    spec:
+      serviceAccountName: reviewer-agent
+      # The image is single-arch (IMAGE_PLATFORM, default linux/amd64); keep the pod on matching nodes.
+      nodeSelector:
+        kubernetes.io/arch: <IMAGE_ARCH>
+      containers:
+        - name: agent
+          # <REVIEWER_IMAGE> is rendered by install.sh (built + pushed by agents/build-images.sh).
+          image: <REVIEWER_IMAGE>
+          imagePullPolicy: Always
+          env:
+            - name: GITHUB_OWNER
+              value: "<GITHUB_OWNER>"
+            - name: GITHUB_REPO
+              value: "<GITHUB_REPO>"
+            - name: LIST_INTERVAL_SECONDS
+              value: "60"
+            - name: MCP_ENDPOINT
+              value: "http://api.githubcopilot.com/mcp/"
+            # Only review PRs on the writer's poem branches; how approved PRs are merged.
+            - name: POEM_BRANCH_PREFIX
+              value: "poem/"
+            - name: MERGE_METHOD
+              value: "squash"
+            - name: LLM_MODE
+              value: "transparent"
+            # The REAL Bedrock runtime host, plaintext http:// (the mesh encrypts; the gateway
+            # injects the token + originates TLS). The agent names the model directly.
+            - name: BEDROCK_ENDPOINT
+              value: "http://bedrock-runtime.us-east-1.amazonaws.com"
+            # Sonnet, not Nova Micro: the Strands agent loop drives the GitHub MCP tools itself
+            # (including the merge), so tool-calling quality is now load-bearing. This inference
+            # profile is already in the per-agent IAM allow-list (setup-pod-identity.sh
+            # SONNET_PROFILE) — on the transparent path that allow-list is the ONLY control on model
+            # choice, so any model set here must be in it or Bedrock returns AccessDeniedException.
+            - name: BEDROCK_MODEL
+              value: "global.anthropic.claude-sonnet-4-6"
+            # Signing/endpoint region for the (unsigned) boto3 client. The gateway re-signs.
+            - name: AWS_REGION
+              value: "us-east-1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # Sized for the Strands runtime: strands-agents pulls in boto3, the OpenAI client, and the
+          # OpenTelemetry SDK, so the resident footprint is a few hundred MB. 128Mi OOMKills on import.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir: {}

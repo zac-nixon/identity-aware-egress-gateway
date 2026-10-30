@@ -1,0 +1,9 @@
+# Strands Agents SDK — the agent runtime (agent loop, MCP tool integration, model providers).
+# The [openai] extra pulls the OpenAI client used by cooperative mode's OpenAIModel; boto3/botocore
+# (transparent mode's BedrockModel) are core dependencies.
+strands-agents[openai]>=1.55,<2
+
+# MCP Python SDK. agent.py imports mcp.client.streamable_http directly, so declare it explicitly
+# rather than relying on the transitive pin. Held on the 1.x line: strands-agents supports both 1.x
+# and 2.x through a compatibility layer, and a fresh install would otherwise resolve to 2.x.
+mcp>=1.23,<2

@@ -1,0 +1,68 @@
+# Per-agent LLM TOKEN budgets — global rate limiting on the LLM egress routes.
+#
+# TWO policies, because the two egress paths expose the model differently:
+#
+#   llm-token-limit-cooperative  -> bedrock-cooperative route. The gateway steers the model and the
+#                                   agent sends "model": "", so llm.requestModel is empty here — we
+#                                   can only key on the agent IDENTITY (per-agent total token budget).
+#   llm-token-limit-transparent  -> bedrock-transparent route. The agent names the model in the
+#                                   Converse URL (/model/<model-id>/converse) and the Detect backend
+#                                   extracts it, so we can key on IDENTITY + MODEL (per-agent,
+#                                   per-model token budget).
+#
+# Both use domain `llm-tokens`; the RLS config (ratelimit/ratelimit-config.yaml) nests the model
+# budget under each identity, so identity-only requests hit the per-agent limit and identity+model
+# requests hit the per-model limit. unit: Tokens => cost is the request's total LLM token count,
+# charged after completion; the external RLS + Redis hold the shared counter across replicas.
+#
+# Independent of model failover: a budget 429 is a gateway-side short-circuit (never reaches Bedrock),
+# so it does NOT evict a model or trigger fallback — it caps spend and returns 429 to the client.
+---
+# COOPERATIVE path — per-agent total (identity only; no reliable model on this path).
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: llm-token-limit-cooperative
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: bedrock-cooperative
+  traffic:
+    rateLimit:
+      global:
+        domain: llm-tokens
+        # Direct URL to the RLS (origin-only). `url` avoids the cross-namespace ReferenceGrant that a
+        # `backendRef` to the ratelimit namespace would require.
+        url: http://ratelimit.ratelimit.svc.cluster.local:8081
+        descriptors:
+          - entries:
+              - name: identity
+                expression: 'request.headers["x-agentgateway-spiffe"]'
+            unit: Tokens
+---
+# TRANSPARENT path — per-agent, per-model. The Detect backend extracts the model from the Converse URL,
+# so llm.requestModel is populated and can be a descriptor entry here (unlike the cooperative path).
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: llm-token-limit-transparent
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: bedrock-transparent
+  traffic:
+    rateLimit:
+      global:
+        domain: llm-tokens
+        url: http://ratelimit.ratelimit.svc.cluster.local:8081
+        descriptors:
+          - entries:
+              - name: identity
+                expression: 'request.headers["x-agentgateway-spiffe"]'
+              - name: model                       # extracted from /model/<model-id>/converse by Detect
+                expression: 'llm.requestModel'
+            unit: Tokens

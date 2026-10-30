@@ -1,0 +1,48 @@
+# TRANSPARENT route: transparently-captured Bedrock traffic -> per-agent transparent backend.
+#
+# The agent addresses the real Bedrock host; the shared catch-all ServiceEntry
+# (gateway/service-entry.yaml) captures it on :80 and lands it on the gateway over HBONE. This route (on the gateway's http listener, matched by the
+# Bedrock host) forwards traffic to the agent's OWN transparent backend, which injects that agent's
+# credential and (now an ai.provider.bedrock + Detect backend) extracts the model + token usage for
+# rate limiting. There is no path match here — all Bedrock runtime paths (/model/<id>/converse,
+# /invoke, etc.) go through, since the agent picks the model/operation in the URL; the backend's
+# ai.routes map decides which of those paths get Detect handling.
+#
+# IDENTITY ROUTING (per-agent credentials): each rule matches one agent's stamped SPIFFE identity
+# (x-agentgateway-spiffe, written by identity-header.yaml) and points at that agent's backend — so
+# the writer and reviewer get DIFFERENT Bedrock credentials (same model as the GitHub MCP route). An
+# identity matching no rule gets a 404 (no LLM access), even after the coarse frontend gate.
+# PREREQUISITE: identity-header.yaml must be applied, or the header never matches.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: bedrock-transparent
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+    - name: egress
+      namespace: agentgateway-system
+      sectionName: http
+  hostnames:
+    - bedrock-runtime.us-east-1.amazonaws.com
+  rules:
+    # Writer identity -> writer's transparent backend (writer credential).
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/writer-agent/sa/writer-agent
+      backendRefs:
+        - name: bedrock-transparent-writer
+          group: agentgateway.dev
+          kind: AgentgatewayBackend
+    # Reviewer identity -> reviewer's transparent backend (reviewer credential).
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/reviewer-agent/sa/reviewer-agent
+      backendRefs:
+        - name: bedrock-transparent-reviewer
+          group: agentgateway.dev
+          kind: AgentgatewayBackend

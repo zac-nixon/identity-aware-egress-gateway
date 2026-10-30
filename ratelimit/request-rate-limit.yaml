@@ -1,0 +1,34 @@
+# Per-agent REQUEST-COUNT limit on the GitHub MCP egress route — the `agentgateway` domain.
+#
+# Each request costs 1 against a per-identity counter: 60 requests/minute per verified SPIFFE
+# identity (rule in ratelimit/ratelimit-config.yaml, config.yaml). The descriptor entry `name` must
+# match the rule's `key` (x-agentgateway-spiffe) exactly; its value is the identity stamped by
+# gateway/identity-header.yaml, which a client cannot spoof.
+#
+# WHY THIS TARGETS ONLY THE github-mcp ROUTE (and not the Gateway):
+# `traffic.rateLimit.global` holds ONE domain, and traffic policy fields merge by specificity — a
+# route-level rateLimit replaces a Gateway-level one rather than stacking with it. The two LLM routes
+# already carry route-level rateLimit policies (llm-token-limit.yaml, domain llm-tokens), so a
+# Gateway-wide request limit would silently apply to GitHub MCP only anyway. Targeting the route
+# says that explicitly. LLM egress is governed by the token budget instead.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: request-rate-limit
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: github-mcp
+  traffic:
+    rateLimit:
+      global:
+        domain: agentgateway
+        # Same direct URL as llm-token-limit.yaml (avoids a cross-namespace ReferenceGrant).
+        url: http://ratelimit.ratelimit.svc.cluster.local:8081
+        descriptors:
+          - entries:
+              - name: x-agentgateway-spiffe
+                expression: 'request.headers["x-agentgateway-spiffe"]'
+            unit: Requests

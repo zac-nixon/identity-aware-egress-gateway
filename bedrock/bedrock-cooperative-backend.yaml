@@ -1,0 +1,169 @@
+# COOPERATIVE-path Bedrock backends — the gateway is an OpenAI-compatible LLM router, with
+# MODEL FALLBACK (priority-group failover) and NO STORED CREDENTIALS.
+#
+# ONE BACKEND PER AGENT, so the writer and reviewer reach Bedrock as DIFFERENT AWS IDENTITIES:
+#   bedrock-cooperative-writer    -> assumes arn:...:role/agentgateway-bedrock-writer
+#   bedrock-cooperative-reviewer  -> assumes arn:...:role/agentgateway-bedrock-reviewer
+# The agent sends OpenAI chat-completions to the GATEWAY with no credentials; the identity-routed
+# HTTPRoute (bedrock-cooperative-route.yaml) picks the agent's backend. Because the gateway owns model
+# choice on this path (the agent is provider- and model-agnostic), it is the natural place for model
+# fallback — contrast bedrock-transparent-backend.yaml, where the agent names the model in the URL, so
+# fallback does not apply there.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# CREDENTIALS: EKS POD IDENTITY + PER-AGENT assumeRole (no Secret, nothing to rotate or leak)
+#
+# There is no Bedrock credential Secret. `policies.auth.aws` signs each request with AWS SigV4
+# instead of injecting a bearer token, and `assumeRole` decides WHICH AWS identity signs:
+#
+#   1. The gateway proxy pod gets credentials from EKS Pod Identity (its ServiceAccount is mapped to
+#      the `agentgateway-egress` IAM role). Those are the SOURCE credentials — that role has NO
+#      Bedrock permissions at all, only sts:AssumeRole + sts:TagSession on the two agent roles.
+#   2. This policy calls STS to assume the per-agent role, and signs the Bedrock call with the
+#      returned credentials. Agentgateway caches them and refreshes before expiry; concurrent
+#      requests needing the same credentials share one STS call.
+#
+# WHY THIS SEGREGATES BETTER THAN TWO BEDROCK API KEYS:
+#   * each agent role's IAM policy scopes bedrock:InvokeModel to SPECIFIC MODEL ARNs, so the writer
+#     literally cannot invoke a model it was not granted. Two opaque bearer keys cannot express that
+#     at the gateway layer.
+#   * CloudTrail records two distinct role sessions (RoleSessionName below), so audit separates with
+#     no correlation work.
+#   * session tags flow to the Cost and Usage Report as resourceTags/user:agent — per-agent LLM spend
+#     attributed by AWS itself, not just by our own Prometheus metrics.
+#   * nothing to rotate, nothing to leak, no Secret in git.
+#
+# With SigV4 the agent cannot sign the request even in principle
+# (it has no AWS credentials and no signing key), so "the agent sends an unsigned request and the
+# gateway attaches authority" stops being a convention we maintain and becomes a property of the
+# protocol.
+#
+# SETUP: install.sh (via bedrock/setup-pod-identity.sh) creates the three roles and the Pod Identity
+# association, and substitutes your account ID for <ACCOUNT_ID> below at apply time.
+#
+# AUTH IS AT PROVIDER LEVEL (providers[].policies.auth), not backend level, because every model tier for an agent must use that SAME agent identity, so
+# failover never changes who is calling. Both tiers below therefore name the same roleArn.
+#
+# region / serviceName are DELIBERATELY OMITTED from the auth block: a typed `bedrock` backend
+# supplies both (region comes from provider.bedrock.region, signing name is `bedrock`). If you ever
+# see a signature mismatch or a "no region" error, set them explicitly under `aws:`.
+#
+# ORDERING CAVEAT: aws SigV4 signing runs LAST, after every policy that mutates the request. Our
+# identity stamp (gateway/identity-header.yaml) is PreRouting, so it runs well before signing and is
+# safe. Do not add a request transformation to these backends — mutating a signed request breaks the
+# signature.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# FAILOVER via PRIORITY GROUPS (spec.ai.groups): groups are tried in listed order — the FIRST group
+# is highest priority. Providers within one group are load balanced (Power-of-Two-Choices). When
+# every provider in a group is evicted (see the health policy below), requests fail over to the next
+# group. Here each agent goes:
+#   group 1 (primary):  global.anthropic.claude-sonnet-4-6   (Sonnet 4.6 inference profile — main
+#                                                             model; the bare/older Sonnet IDs are
+#                                                             rejected for on-demand, use the profile)
+#   group 2 (fallback): amazon.nova-lite-v1:0                (Nova — used only while Sonnet is evicted)
+# Add more groups for deeper fallback (e.g. another Nova tier, or a different provider entirely).
+#
+# REQUIRED PAIRING: priority groups only fail over if a health policy EVICTS unhealthy providers —
+# see bedrock-failover-policy.yaml. Without it, a failing primary is never evicted and no failover
+# happens.
+#
+# NOTE: whichever models you list here must be in the corresponding role's IAM policy, or failover
+# will "work" and then get AccessDeniedException from Bedrock on the fallback tier. Keep
+# setup-pod-identity.sh and this file in sync.
+#
+# OSS: `spec.ai.groups` (priority-group failover) is part of the open-source agentgateway.dev
+# AgentgatewayBackend API — no enterprise CRDs required. Solo's failover guide happens to render the
+# same fields on the Enterprise* kinds, but the OSS kinds carry them; see this end-to-end OSS
+# walkthrough for the same AgentgatewayBackend groups + AgentgatewayPolicy health pattern:
+# https://www.cloudnativedeepdive.com/multi-model-failover-in-your-ai-gateway/
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-cooperative-writer
+  namespace: agentgateway-system
+spec:
+  ai:
+    groups:
+      # Priority 1 (primary): Claude Sonnet.
+      - providers:
+          - name: writer-sonnet
+            bedrock:
+              model: "global.anthropic.claude-sonnet-4-6"
+              region: "us-east-1"
+            policies:
+              auth:
+                aws:
+                  assumeRole:
+                    # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+                    # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+                    # placeholder is REJECTED by the API server — never apply this file directly.
+                    roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-writer
+                    sessionName: writer-agent
+                    tags:
+                      - key: agent
+                        value: writer
+      # Priority 2 (fallback): Nova Lite — used only while the primary group is evicted.
+      - providers:
+          - name: writer-nova
+            bedrock:
+              model: "amazon.nova-lite-v1:0"
+              region: "us-east-1"
+            policies:
+              auth:
+                aws:
+                  assumeRole:
+                    # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+                    # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+                    # placeholder is REJECTED by the API server — never apply this file directly.
+                    roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-writer
+                    sessionName: writer-agent
+                    tags:
+                      - key: agent
+                        value: writer
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-cooperative-reviewer
+  namespace: agentgateway-system
+spec:
+  ai:
+    groups:
+      # Priority 1 (primary): Claude Sonnet.
+      - providers:
+          - name: reviewer-sonnet
+            bedrock:
+              model: "global.anthropic.claude-sonnet-4-6"
+              region: "us-east-1"
+            policies:
+              auth:
+                aws:
+                  assumeRole:
+                    # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+                    # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+                    # placeholder is REJECTED by the API server — never apply this file directly.
+                    roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-reviewer
+                    sessionName: reviewer-agent
+                    tags:
+                      - key: agent
+                        value: reviewer
+      # Priority 2 (fallback): Nova Lite — used only while the primary group is evicted.
+      - providers:
+          - name: reviewer-nova
+            bedrock:
+              model: "amazon.nova-lite-v1:0"
+              region: "us-east-1"
+            policies:
+              auth:
+                aws:
+                  assumeRole:
+                    # <ACCOUNT_ID> is substituted by install.sh at apply time. The CRD validates
+                    # roleArn against ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$, so an unsubstituted
+                    # placeholder is REJECTED by the API server — never apply this file directly.
+                    roleArn: arn:aws:iam::<ACCOUNT_ID>:role/agentgateway-bedrock-reviewer
+                    sessionName: reviewer-agent
+                    tags:
+                      - key: agent
+                        value: reviewer

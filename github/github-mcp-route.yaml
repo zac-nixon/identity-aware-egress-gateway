@@ -1,0 +1,53 @@
+# Identity-based routing at the GitHub MCP egress gateway.
+#
+# Transparent-egress via the VERIFIED HBONE-endpoint dispatch: the agent addresses the real host
+# (http://api.githubcopilot.com/mcp/); the shared catch-all ServiceEntry (gateway/service-entry.yaml)
+# captures that :80 connection in-mesh; ztunnel tunnels the request over HBONE to the gateway,
+# which dispatches the unwrapped connection to its HTTP (:80) listener. This HTTPRoute attaches to
+# that listener (parent = Gateway, sectionName: http) and matches the host, then:
+#
+#   1. the shared PreRouting stamp (identity-header.yaml) has already written the verified
+#      source.identity into x-agentgateway-spiffe (set = overwrites any client value, unspoofable)
+#   2. a rule matches that header -> the agent's own backend -> that agent's credential + TLS to GitHub
+#
+#   writer   identity -> github-mcp-writer   backend -> writer token injected
+#   reviewer identity -> github-mcp-reviewer backend -> reviewer token injected
+#   any other identity                                -> no rule matches -> 404 (no credential)
+#
+# The frontend edge gate (gateway/frontend-authz.yaml) denies any caller with no verified identity, so
+# nothing reaches PreRouting without an identity to stamp.
+#
+# PREREQUISITE: apply identity-header.yaml (the Gateway-wide SPIFFE stamp) — this route's header
+# matches are meaningless without it. It lives in its own manifest because the same stamp also
+# authenticates the Bedrock routes.
+---
+# Attaches to the Gateway's http listener; matches the GitHub host; routes per stamped identity.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: github-mcp
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+    - name: egress
+      namespace: agentgateway-system
+      sectionName: http        # the inner HTTP listener the HBONE dispatch lands on
+  hostnames:
+    - api.githubcopilot.com
+  rules:
+    # Writer identity -> writer backend (writer credential).
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/writer-agent/sa/writer-agent
+      backendRefs:
+        - { name: github-mcp-writer, group: agentgateway.dev, kind: AgentgatewayBackend }
+    # Reviewer identity -> reviewer backend (reviewer credential).
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-agentgateway-spiffe
+              value: spiffe://cluster.local/ns/reviewer-agent/sa/reviewer-agent
+      backendRefs:
+        - { name: github-mcp-reviewer, group: agentgateway.dev, kind: AgentgatewayBackend }

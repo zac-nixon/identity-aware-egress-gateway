@@ -1,0 +1,37 @@
+# Gateway-wide edge identity gate (shared by ALL egress — GitHub MCP and Bedrock alike).
+#
+# "Must be an authenticated mesh workload." Coarse and Gateway-wide (frontend.networkAuthorization):
+# it enumerates NO agents. It denies any caller with no verified HBONE peer identity, so only
+# authenticated mesh workloads reach the gateway. This is the repo-verified L4 gate
+# (agentgateway/FINDINGS.md + hbone-gateway-llm.md). It targets the Gateway; `frontend` policies can
+# only target a Gateway. It lives in gateway/ (not github/) because it is not provider-specific.
+#
+# WHICH agents are allowed, and which credential each gets, is NOT decided here — it is decided by
+# identity-based routing (github/github-mcp-route.yaml, bedrock/*-route.yaml): the stamped SPIFFE
+# identity (gateway/identity-header.yaml) selects the agent's backend, and an identity matching no
+# routing rule gets a 404 (no backend, no credential). So the per-agent allow-list lives in the
+# routing rules, and this gate stays coarse — no duplicated agent list, and the gateway is not
+# single-tenant.
+#
+# `frontend` policies can target ONLY a Gateway (no sectionName); that Gateway-wide scope is also
+# what lets this one gate cover the inner :80 bind and close the bypass.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: require-mesh-identity
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: egress
+  frontend:
+    networkAuthorization:
+      action: Allow
+      policy:
+        matchExpressions:
+          # Present a verified HBONE peer identity in our trust domain. No agent names — routing
+          # (github-mcp-route.yaml) selects the per-agent backend/credential by identity.
+          - |
+            has(source.identity.serviceAccount) &&
+            source.identity.trustDomain == "cluster.local"

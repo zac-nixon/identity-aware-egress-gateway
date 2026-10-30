@@ -1,0 +1,91 @@
+# Writer agent — TRANSPARENT version: the app speaks to the REAL Bedrock API; the gateway
+# transparently injects the credential.
+#
+# The agent makes a Bedrock-native Converse call to the real Bedrock runtime host (BEDROCK_ENDPOINT),
+# with NO credential and over plain http:// (so the gateway can see and inject). ztunnel captures
+# the egress (gateway/service-entry.yaml sends all :80 traffic to the gateway); the gateway
+# injects the Bedrock token + originates TLS to Bedrock. The AGENT picks the model (BEDROCK_MODEL,
+# which goes in the Bedrock URL) — the gateway only vends the credential, it does not steer.
+#
+# This is the "unmodified Bedrock client, minus the credentials" model. Contrast with
+# writer-agent-cooperative.yaml (gateway steers the model in OpenAI format).
+#
+# Uses the shared ServiceAccount from writer-agent-sa.yaml (identity spiffe://.../sa/writer-agent).
+#   kubectl apply -f writer-agent-sa.yaml -f writer-agent-transparent.yaml
+#   kubectl -n writer-agent logs deploy/writer-agent-transparent -f
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer-agent-transparent
+  namespace: writer-agent
+  labels:
+    app: writer-agent-transparent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer-agent-transparent
+  template:
+    metadata:
+      labels:
+        app: writer-agent-transparent
+    spec:
+      serviceAccountName: writer-agent
+      # The image is single-arch (IMAGE_PLATFORM, default linux/amd64); keep the pod on matching nodes.
+      nodeSelector:
+        kubernetes.io/arch: <IMAGE_ARCH>
+      containers:
+        - name: agent
+          # <WRITER_IMAGE> is rendered by install.sh (built + pushed by agents/build-images.sh).
+          image: <WRITER_IMAGE>
+          imagePullPolicy: Always
+          env:
+            - name: GITHUB_OWNER
+              value: "<GITHUB_OWNER>"
+            - name: GITHUB_REPO
+              value: "<GITHUB_REPO>"
+            - name: GITHUB_ISSUE_STATE
+              value: "open"
+            - name: LIST_INTERVAL_SECONDS
+              value: "60"
+            - name: MCP_ENDPOINT
+              value: "http://api.githubcopilot.com/mcp/"
+            - name: LLM_MODE
+              value: "transparent"
+            # The REAL Bedrock runtime host, plaintext http:// (the mesh encrypts; the gateway
+            # injects the token + originates TLS). The agent names the model directly.
+            - name: BEDROCK_ENDPOINT
+              value: "http://bedrock-runtime.us-east-1.amazonaws.com"
+            # Sonnet, not Nova Micro: the Strands agent loop drives the GitHub MCP tools itself, so
+            # tool-calling quality is now load-bearing. This inference profile is already in the
+            # per-agent IAM allow-list (setup-pod-identity.sh SONNET_PROFILE) — on the transparent path
+            # that allow-list is the ONLY control on model choice, so any model set here must be in
+            # it or Bedrock returns AccessDeniedException.
+            - name: BEDROCK_MODEL
+              value: "global.anthropic.claude-sonnet-4-6"
+            # Signing/endpoint region for the (unsigned) boto3 client. The gateway re-signs.
+            - name: AWS_REGION
+              value: "us-east-1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # Sized for the Strands runtime: strands-agents pulls in boto3, the OpenAI client, and the
+          # OpenTelemetry SDK, so the resident footprint is a few hundred MB. 128Mi OOMKills on import.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,39 @@
+# Shared transparent-capture ServiceEntry for ALL governed egress (GitHub MCP + Bedrock transparent).
+#
+# One catch-all instead of a ServiceEntry per destination host. It declares every IPv4 address (0.0.0.0/0) on TCP :80 as a mesh
+# service whose only endpoints are the Agent Gateway egress pods (workloadSelector). So when an agent
+# dials http://<any-real-host>/ — DNS returns the host's public IP as usual — ztunnel matches that IP
+# here and tunnels the connection over HBONE (:15008) to the gateway instead of sending it out.
+#
+# The gateway, not this object, decides what is allowed: routes match on the HTTP Host header
+# (github/github-mcp-route.yaml, bedrock/bedrock-transparent-route.yaml) plus the stamped caller identity.
+# A captured :80 request for a host no route lists gets a 404 from the gateway — it never leaves.
+#
+# Only :80 is captured. That is deliberate: agents speak plaintext HTTP so the gateway can inject
+# credentials and originate TLS itself. Traffic on any other port (e.g. TLS on :443) is NOT captured,
+# so ztunnel sends it direct — and agents/appnetworkpolicy.yaml drops it at the node. Both outcomes
+# are fail-closed.
+#
+# `hosts` is a required label, not a real hostname; nothing resolves `internal-catchall`.
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: egress-catchall
+  namespace: agentgateway-system
+spec:
+  addresses:
+  - 0.0.0.0/0
+  exportTo:
+  - '*'
+  hosts:
+  - internal-catchall
+  location: MESH_INTERNAL
+  ports:
+  - name: tcp
+    number: 80
+    protocol: TCP
+    targetPort: 80
+  resolution: STATIC
+  workloadSelector:
+    labels:
+      app: agentgateway-egress

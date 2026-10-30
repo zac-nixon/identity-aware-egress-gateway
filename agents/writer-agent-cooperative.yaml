@@ -1,0 +1,83 @@
+# Writer agent — COOPERATIVE version: the gateway is an OpenAI-compatible LLM router.
+#
+# The agent sends OpenAI chat-completions requests to the GATEWAY (LLM_ENDPOINT), with NO
+# credential. The gateway steers the model/provider (Bedrock today) and injects the token. The
+# agent is provider-agnostic — it never names Bedrock or a model.
+#
+# Contrast with writer-agent-transparent.yaml, which calls the real Bedrock API directly and lets the
+# gateway transparently inject the credential.
+#
+# Uses the shared ServiceAccount from writer-agent-sa.yaml (identity spiffe://.../sa/writer-agent).
+#   kubectl apply -f writer-agent-sa.yaml -f writer-agent-cooperative.yaml
+#   kubectl -n writer-agent logs deploy/writer-agent-cooperative -f
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer-agent-cooperative
+  namespace: writer-agent
+  labels:
+    app: writer-agent-cooperative
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer-agent-cooperative
+  template:
+    metadata:
+      labels:
+        app: writer-agent-cooperative
+    spec:
+      serviceAccountName: writer-agent
+      # The image is single-arch (IMAGE_PLATFORM, default linux/amd64); keep the pod on matching nodes.
+      nodeSelector:
+        kubernetes.io/arch: <IMAGE_ARCH>
+      containers:
+        - name: agent
+          # <WRITER_IMAGE> is rendered by install.sh (built + pushed by agents/build-images.sh).
+          image: <WRITER_IMAGE>
+          imagePullPolicy: Always
+          env:
+            - name: GITHUB_OWNER
+              value: "<GITHUB_OWNER>"
+            - name: GITHUB_REPO
+              value: "<GITHUB_REPO>"
+            - name: GITHUB_ISSUE_STATE
+              value: "open"
+            - name: LIST_INTERVAL_SECONDS
+              value: "60"
+            - name: MCP_ENDPOINT
+              value: "http://api.githubcopilot.com/mcp/"
+            - name: LLM_MODE
+              value: "cooperative"
+            # The gateway's own Service as an OpenAI-compatible endpoint; the gateway steers the
+            # model and injects the credential. No creds here. VERIFY the Service name:
+            #   kubectl -n agentgateway-system get svc   (the one on :80; derived from Gateway 'egress')
+            - name: LLM_ENDPOINT
+              value: "http://egress.agentgateway-system.svc.cluster.local/v1"
+            # Left empty on purpose: an empty model lets the gateway's backend pick, including its
+            # priority-group failover (Sonnet -> Nova). Set it only to request a specific model.
+            - name: COOPERATIVE_MODEL
+              value: ""
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # Sized for the Strands runtime: strands-agents pulls in boto3, the OpenAI client, and the
+          # OpenTelemetry SDK, so the resident footprint is a few hundred MB. 128Mi OOMKills on import.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir: {}
